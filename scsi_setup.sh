@@ -1,4 +1,3 @@
-sudo rmmod scsi_debug
 sudo modprobe scsi_debug
 sudo sh -c "echo $1 > /sys/bus/pseudo/drivers/scsi_debug/max_luns"
 sudo sh -c "echo $1 > /sys/bus/pseudo/drivers/scsi_debug/num_tgts"
