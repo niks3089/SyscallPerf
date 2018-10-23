@@ -1,4 +1,4 @@
-sudo modprobe dummy
+#sudo modprobe dummy
 
 sudo ifconfig dummy0 down && sudo ip link del dummy0 type dummy 
 sudo ifconfig dummy1 down && sudo ip link del dummy1 type dummy

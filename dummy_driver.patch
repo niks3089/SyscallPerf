@@ -1,0 +1,393 @@
+diff --git a/drivers/net/dummy.c b/drivers/net/dummy.c
+index 58483af80..bea0f71d7 100644
+--- a/drivers/net/dummy.c
++++ b/drivers/net/dummy.c
+@@ -30,23 +30,41 @@
+ 
+ #include <linux/module.h>
+ #include <linux/kernel.h>
++#include <linux/workqueue.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/init.h>
+ #include <linux/moduleparam.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/net_tstamp.h>
++#include <linux/tcp.h>
++#include <net/tcp.h>
++#include <linux/ip.h>
++#include <net/ip.h>
++#include <linux/udp.h>
++#include <net/udp.h>
+ #include <net/rtnetlink.h>
++#include <linux/kthread.h>
++#include <linux/delay.h>
+ #include <linux/u64_stats_sync.h>
+ 
+ #define DRV_NAME	"dummy"
+-#define DRV_VERSION	"1.0"
++#define DRV_VERSION	"1.2"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) DRV_NAME ": " fmt
+ 
+ static int numdummies = 1;
+ static int num_vfs;
++static int num_echo_pkt = 1;
++static unsigned long data_acked_counter = 0;
++
++struct receiver_workq {
++    struct work_struct real_work;
++    void *data;
++};
++
++struct receiver_workq *receiver = NULL;
+ 
+ struct vf_data_storage {
+ 	u8	vf_mac[ETH_ALEN];
+@@ -97,7 +115,7 @@ struct pcpu_dstats {
+ };
+ 
+ static void dummy_get_stats64(struct net_device *dev,
+-			      struct rtnl_link_stats64 *stats)
++				  struct rtnl_link_stats64 *stats)
+ {
+ 	int i;
+ 
+@@ -117,8 +135,234 @@ static void dummy_get_stats64(struct net_device *dev,
+ 	}
+ }
+ 
++static struct sk_buff* swap_ip_addr_udp_port(struct sk_buff* skb)
++{
++    if (!skb) {
++        return NULL;
++    }
++	struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
++
++	if (!ip_header || ip_header->protocol != 17) {
++		return NULL;
++	}
++
++	struct sk_buff* new_skb = skb_copy(skb, GFP_ATOMIC);
++	
++	struct iphdr *iph = (struct iphdr *)skb_network_header(skb);
++	struct udphdr *th = (struct udphdr *)udp_hdr(skb);
++
++	struct iphdr *newiph = (struct iphdr *)skb_network_header(new_skb);
++	struct udphdr *newth = (struct udphdr *)udp_hdr(new_skb);
++
++    if(skb_is_nonlinear(new_skb))
++        skb_linearize(new_skb);
++
++    newiph->saddr = iph->daddr;
++    newiph->daddr = iph->saddr;
++    newth->source = th->dest;
++    newth->dest = th->source;
++
++    new_skb->csum_valid = 0;
++    new_skb->csum = 0;
++	newiph->check = 0;
++    newiph->check = ip_fast_csum((u8 *)newiph, newiph->ihl);
++    newth->check = 0;
++    unsigned int udplen = ntohs(newiph->tot_len) - newiph->ihl*4;
++    newth->check = udp_v4_check(udplen, newiph->saddr, 
++            newiph->daddr, csum_partial((char *)newth, udplen, 0));
++    new_skb->protocol = eth_type_trans(new_skb, skb->dev);
++
++	return new_skb;
++}
++
++static struct sk_buff* tcp_recal_checksum(struct sk_buff *skb)
++{
++	struct iphdr *iph = (struct iphdr *)skb_network_header(skb);
++	struct tcphdr *th = (struct tcphdr *)tcp_hdr(skb);
++
++    skb->csum_valid = 0;
++    skb->csum = 0;
++	iph->check = 0;
++    iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
++    th->check = 0;
++    unsigned int tcplen = ntohs(iph->tot_len) - iph->ihl*4;
++    th->check = tcp_v4_check(tcplen, iph->saddr, 
++            iph->daddr, csum_partial((char *)th, tcplen, 0));
++
++	return skb;
++}
++
++static struct sk_buff* tcp_create_ack(struct sk_buff *skb, int data_len)
++{
++    struct sk_buff* new_skb = NULL;
++
++    if (!skb) {
++        return NULL;
++    }
++	struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
++
++	if (!ip_header || ip_header->protocol != 6) {
++		return NULL;
++	}
++
++    if (data_len) {
++	    new_skb = skb_copy(skb, GFP_ATOMIC);
++        /* Remove data from skb */
++        skb_trim(new_skb, skb_headlen(new_skb) - data_len);
++    } else {
++	    new_skb = skb_copy(skb, GFP_ATOMIC);
++    }
++	
++	struct iphdr *iph = (struct iphdr *)skb_network_header(skb);
++	struct tcphdr *th = (struct tcphdr *)tcp_hdr(skb);
++
++	struct iphdr *newiph = (struct iphdr *)skb_network_header(new_skb);
++	struct tcphdr *newth = (struct tcphdr *)tcp_hdr(new_skb);
++
++    if(skb_is_nonlinear(new_skb))
++        skb_linearize(new_skb);
++
++    newiph->saddr = iph->daddr;
++    newiph->daddr = iph->saddr;
++    newth->source = th->dest;
++    newth->dest = th->source;
++    if (!th->ack_seq) {
++        get_random_bytes(newth->seq, 4);
++    } else {
++        newth->seq = th->ack_seq;
++    }
++
++    if (th->fin) {
++        newth->fin = 0;
++        newth->rst = 1;
++    }
++
++    data_acked_counter += data_len;
++    int acked_bytes = data_len ? data_len : 1;
++    newth->ack_seq = htonl(ntohl(th->seq) + acked_bytes);
++    newth->ack = 1;
++    newth->psh = 0;
++
++    if (data_len) {
++        newiph->tot_len = htons(ntohs(newiph->tot_len) - data_len);
++    }
++
++    new_skb = tcp_recal_checksum(new_skb);
++    new_skb->protocol = eth_type_trans(new_skb, skb->dev);
++    return new_skb;
++}
++
++static int echo_response(struct sk_buff *skb)
++{
++	struct sk_buff *new_skb = swap_ip_addr_udp_port(skb);
++	if (new_skb) {
++		netif_rx(new_skb);
++        return 0;
++	}
++    return -1;
++}
++
++static void echo_multiple_responses(struct sk_buff *skb)
++{
++    int i = 0;
++	while(i++ < num_echo_pkt) {
++        if (i % 1000 == 0) {
++            mdelay(1000);
++        }
++		if (echo_response(skb) < 0) {
++            break;
++        }
++	}
++	pr_err( "Nik: Num echo resp: %d\n", num_echo_pkt);
++}
++
++void udp_server_fn(struct work_struct *work)
++{
++    struct receiver_workq *c_ptr = container_of(work, struct receiver_workq, real_work);
++    struct sk_buff *skb = (struct sk_buff *)c_ptr->data;
++    echo_multiple_responses(skb);
++	dev_kfree_skb(skb);
++}
++
++static void udp_server(struct net_device *dev, struct sk_buff *skb)
++{
++
++	struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
++
++	struct udphdr *udp = (struct udphdr *)udp_hdr(skb);
++    if (ip_header->protocol == 17 && udp && ntohs(udp->dest) != 5555) {
++        return;
++    }
++
++    pr_err("Nik: Creating kernel thread\n");
++
++    INIT_WORK(&receiver->real_work, udp_server_fn);
++    receiver->data = skb;
++    schedule_work(&receiver->real_work);
++
++    if (receiver) {
++        pr_err("Nik: Thread created successfully\n");
++    } else {
++        pr_err("Nik: Failed to create thread\n");
++    }
++}
++
++static void tcp_server(struct net_device *dev, struct sk_buff *skb)
++{
++	struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
++	struct tcphdr *tcp_header = (struct tcphdr *)tcp_hdr(skb);
++
++	if (!ip_header || ip_header->protocol != 6) {
++        return;
++    }
++
++    // Forget about state machines. Assume best case
++    if (tcp_header->syn) {
++        pr_err("Nik: Preparing synack\n");
++        struct sk_buff *synack = tcp_create_ack(skb, 0);
++        if(synack)
++        {
++            pr_err("Nik: Sending synack\n");
++            netif_rx(synack);
++        }
++    } else if (tcp_header->fin || tcp_header->rst) {
++        struct sk_buff *finack = tcp_create_ack(skb, 0);
++        if(finack)
++        {
++            pr_err("Nik: Sending finack. Total data acked: %lu\n",
++                    data_acked_counter);
++            data_acked_counter = 0;
++            netif_rx(finack);
++        }
++    } else if (tcp_header->ack) {
++        /* Check if there is data. Only Ack back for data packets */
++        int tcpdatalen = ntohs(ip_header->tot_len) - (tcp_header->doff * 4) -
++            (ip_header->ihl * 4);
++        if (tcpdatalen) {
++            struct sk_buff *ack = tcp_create_ack(skb, tcpdatalen);
++            if(ack)
++            {
++                netif_rx(ack);
++            }
++        }
++    }
++	dev_kfree_skb(skb);
++}
++
++static void trans_receiver(struct net_device *dev, struct sk_buff *skb)
++{
++	struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
++
++	if (ip_header->protocol == 6) {
++        tcp_server(dev, skb);
++    } else if (ip_header->protocol == 17) {
++        udp_server(dev, skb);
++    }
++}
++
+ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
++    bool hack = 1;
+ 	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
+ 
+ 	u64_stats_update_begin(&dstats->syncp);
+@@ -127,7 +371,12 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	u64_stats_update_end(&dstats->syncp);
+ 
+ 	skb_tx_timestamp(skb);
+-	dev_kfree_skb(skb);
++
++    if (hack) {
++        trans_receiver(dev, skb);
++    } else {
++	    dev_kfree_skb(skb);
++    }
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -146,7 +395,7 @@ static int dummy_dev_init(struct net_device *dev)
+ 
+ 	dev->dev.parent = &dummy_parent;
+ 	priv->vfinfo = kcalloc(num_vfs, sizeof(struct vf_data_storage),
+-			       GFP_KERNEL);
++				   GFP_KERNEL);
+ 	if (!priv->vfinfo) {
+ 		free_percpu(dev->dstats);
+ 		return -ENOMEM;
+@@ -182,7 +431,7 @@ static int dummy_set_vf_mac(struct net_device *dev, int vf, u8 *mac)
+ }
+ 
+ static int dummy_set_vf_vlan(struct net_device *dev, int vf,
+-			     u16 vlan, u8 qos, __be16 vlan_proto)
++				 u16 vlan, u8 qos, __be16 vlan_proto)
+ {
+ 	struct dummy_priv *priv = netdev_priv(dev);
+ 
+@@ -246,7 +495,7 @@ static int dummy_set_vf_trust(struct net_device *dev, int vf, bool val)
+ }
+ 
+ static int dummy_get_vf_config(struct net_device *dev,
+-			       int vf, struct ifla_vf_info *ivi)
++				   int vf, struct ifla_vf_info *ivi)
+ {
+ 	struct dummy_priv *priv = netdev_priv(dev);
+ 
+@@ -300,14 +549,14 @@ static const struct net_device_ops dummy_netdev_ops = {
+ };
+ 
+ static void dummy_get_drvinfo(struct net_device *dev,
+-			      struct ethtool_drvinfo *info)
++				  struct ethtool_drvinfo *info)
+ {
+ 	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
+ 	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+ }
+ 
+ static int dummy_get_ts_info(struct net_device *dev,
+-			      struct ethtool_ts_info *ts_info)
++				  struct ethtool_ts_info *ts_info)
+ {
+ 	ts_info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+ 				   SOF_TIMESTAMPING_RX_SOFTWARE |
+@@ -319,7 +568,7 @@ static int dummy_get_ts_info(struct net_device *dev,
+ };
+ 
+ static const struct ethtool_ops dummy_ethtool_ops = {
+-	.get_drvinfo            = dummy_get_drvinfo,
++	.get_drvinfo			= dummy_get_drvinfo,
+ 	.get_ts_info		= dummy_get_ts_info,
+ };
+ 
+@@ -382,6 +631,9 @@ MODULE_PARM_DESC(numdummies, "Number of dummy pseudo devices");
+ module_param(num_vfs, int, 0);
+ MODULE_PARM_DESC(num_vfs, "Number of dummy VFs per dummy device");
+ 
++module_param(num_echo_pkt, int, 0);
++MODULE_PARM_DESC(num_echo_pkt, "Number of packets to echo");
++
+ static int __init dummy_init_one(void)
+ {
+ 	struct net_device *dev_dummy;
+@@ -407,6 +659,7 @@ static int __init dummy_init_module(void)
+ {
+ 	int i, err = 0;
+ 
++    receiver = kmalloc(sizeof(*receiver), GFP_KERNEL);
+ 	if (num_vfs) {
+ 		err = bus_register(&dummy_bus);
+ 		if (err < 0) {
+@@ -453,6 +706,11 @@ static void __exit dummy_cleanup_module(void)
+ 		device_unregister(&dummy_parent);
+ 		bus_unregister(&dummy_bus);
+ 	}
++
++    if (receiver) {
++        flush_work(&receiver->real_work);
++        kfree(receiver);
++    }
+ }
+ 
+ module_init(dummy_init_module);
+@@ -460,3 +718,4 @@ module_exit(dummy_cleanup_module);
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS_RTNL_LINK(DRV_NAME);
+ MODULE_VERSION(DRV_VERSION);
++MODULE_AUTHOR("Nikhil");
