@@ -8,7 +8,7 @@ fi
 curr_interface=0
 while [ $curr_interface -lt $1 ]
 do
-    ./dummy_interface_setup.sh $curr_interface
+    ./helper_scripts/dummy_interface_setup.sh $curr_interface
     ./helper_scripts/create_tap.sh $curr_interface 
     # Delete static arp entries
     sudo arp -d $((10 + $curr_interface)).0.0.100
