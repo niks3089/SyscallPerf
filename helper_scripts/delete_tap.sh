@@ -1,14 +1,14 @@
-tap=$1
-dummy=$2
-BRIDGE=$3
-GATEWAY=$4
-
 #Example: 
-#create_tap tap100 dummy0 br100 10.0.0.2
-if [ $# -ne 4 ]; then
-    echo "create_tap <tap> <dummy> <bridge> <bridge ip>"
+#delete_tap tap100 dummy0 br100
+if [ $# -ne 1 ]; then
+    echo "delete_tap <tap_offset>"
     exit 1
 fi
+
+tap=tap10$1
+dummy=dummy$1
+bridge_id=$((100 + $1))
+BRIDGE=br$bridge_id
 
 #clear things
 sudo ifconfig $BRIDGE down && sudo brctl delbr $BRIDGE

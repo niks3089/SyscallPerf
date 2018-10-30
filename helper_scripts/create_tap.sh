@@ -1,17 +1,19 @@
-tap=$1
-dummy=$2
-BRIDGE=$3
-GATEWAY=$4
-MAC=$5
-
 #Example: 
 #create_tap tap100 dummy0 br100 10.0.0.2 02:01:02:03:04:08
-if [ $# -ne 5 ]; then
-    echo "create_tap <tap> <dummy> <bridge> <bridge ip> <mac>"
+if [ $# -ne 1 ]; then
+    echo "create_tap <tap_offset>"
     exit 1
 fi
 
-./delete_tap.sh $tap $dummy $BRIDGE $GATEWAY
+tap=tap10$1
+dummy=dummy$1
+bridge_id=$((100 + $1))
+ip_offset=$((10 + $1))
+mac_offset=$((10 + $1))
+
+BRIDGE=br$bridge_id
+GATEWAY=$ip_offset.0.0.2
+MAC=02:01:02:03:04:$mac_offset
 
 #add things
 sudo brctl addbr $BRIDGE && \

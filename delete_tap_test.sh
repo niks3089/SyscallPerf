@@ -1,5 +1,13 @@
-./helper_scripts/delete_tap.sh tap100 dummy0 br100 10.0.0.2
-./helper_scripts/delete_tap.sh tap101 dummy1 br101 11.0.0.2
-./helper_scripts/delete_tap.sh tap102 dummy2 br102 12.0.0.2
+if [ $# -ne 1 ]; then
+    echo "delete_tap_test.sh <number of tap interfaces>"
+    exit 1
+fi
+
+curr_interface=0
+while [ $curr_interface -lt $1 ]
+do
+    ./helper_scripts/delete_tap.sh $curr_interface
+    curr_interface=`expr $curr_interface + 1`
+done
 
 brctl show
