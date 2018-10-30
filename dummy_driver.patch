@@ -1,8 +1,8 @@
 diff --git a/drivers/net/dummy.c b/drivers/net/dummy.c
-index 58483af80..bea0f71d7 100644
+index 58483af80..68af8dd6a 100644
 --- a/drivers/net/dummy.c
 +++ b/drivers/net/dummy.c
-@@ -30,23 +30,41 @@
+@@ -30,23 +30,42 @@
  
  #include <linux/module.h>
  #include <linux/kernel.h>
@@ -34,6 +34,7 @@ index 58483af80..bea0f71d7 100644
  static int numdummies = 1;
  static int num_vfs;
 +static int num_echo_pkt = 1;
++static int only_receive = 0;
 +static unsigned long data_acked_counter = 0;
 +
 +struct receiver_workq {
@@ -45,7 +46,7 @@ index 58483af80..bea0f71d7 100644
  
  struct vf_data_storage {
  	u8	vf_mac[ETH_ALEN];
-@@ -97,7 +115,7 @@ struct pcpu_dstats {
+@@ -97,7 +116,7 @@ struct pcpu_dstats {
  };
  
  static void dummy_get_stats64(struct net_device *dev,
@@ -54,7 +55,7 @@ index 58483af80..bea0f71d7 100644
  {
  	int i;
  
-@@ -117,8 +135,234 @@ static void dummy_get_stats64(struct net_device *dev,
+@@ -117,6 +136,231 @@ static void dummy_get_stats64(struct net_device *dev,
  	}
  }
  
@@ -179,24 +180,24 @@ index 58483af80..bea0f71d7 100644
 +{
 +	struct sk_buff *new_skb = swap_ip_addr_udp_port(skb);
 +	if (new_skb) {
-+		netif_rx(new_skb);
-+        return 0;
++		return netif_rx(new_skb);
 +	}
 +    return -1;
 +}
 +
 +static void echo_multiple_responses(struct sk_buff *skb)
 +{
-+    int i = 0;
++    int i = 0, dropped = 0;
 +	while(i++ < num_echo_pkt) {
-+        if (i % 1000 == 0) {
-+            mdelay(1000);
++        if (i % 100 == 0) {
++            mdelay(100);
 +        }
-+		if (echo_response(skb) < 0) {
-+            break;
++		if (echo_response(skb) != 0) {
++            dropped++;
 +        }
 +	}
-+	pr_err( "Nik: Num echo resp: %d\n", num_echo_pkt);
++	pr_err( "Nik: Send echo respones: %d, dropped:%d\n",
++            i - 1, dropped);
 +}
 +
 +void udp_server_fn(struct work_struct *work)
@@ -285,20 +286,17 @@ index 58483af80..bea0f71d7 100644
 +
  static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
  {
-+    bool hack = 1;
  	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
- 
- 	u64_stats_update_begin(&dstats->syncp);
 @@ -127,7 +371,12 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
  	u64_stats_update_end(&dstats->syncp);
  
  	skb_tx_timestamp(skb);
 -	dev_kfree_skb(skb);
 +
-+    if (hack) {
-+        trans_receiver(dev, skb);
-+    } else {
++    if (only_receive) {
 +	    dev_kfree_skb(skb);
++    } else {
++        trans_receiver(dev, skb);
 +    }
  	return NETDEV_TX_OK;
  }
@@ -356,17 +354,20 @@ index 58483af80..bea0f71d7 100644
  	.get_ts_info		= dummy_get_ts_info,
  };
  
-@@ -382,6 +631,9 @@ MODULE_PARM_DESC(numdummies, "Number of dummy pseudo devices");
+@@ -382,6 +631,12 @@ MODULE_PARM_DESC(numdummies, "Number of dummy pseudo devices");
  module_param(num_vfs, int, 0);
  MODULE_PARM_DESC(num_vfs, "Number of dummy VFs per dummy device");
  
++module_param(only_receive, int, 0);
++MODULE_PARM_DESC(only_receive, "Sink packets without responding");
++
 +module_param(num_echo_pkt, int, 0);
 +MODULE_PARM_DESC(num_echo_pkt, "Number of packets to echo");
 +
  static int __init dummy_init_one(void)
  {
  	struct net_device *dev_dummy;
-@@ -407,6 +659,7 @@ static int __init dummy_init_module(void)
+@@ -407,6 +662,7 @@ static int __init dummy_init_module(void)
  {
  	int i, err = 0;
  
@@ -374,7 +375,7 @@ index 58483af80..bea0f71d7 100644
  	if (num_vfs) {
  		err = bus_register(&dummy_bus);
  		if (err < 0) {
-@@ -453,6 +706,11 @@ static void __exit dummy_cleanup_module(void)
+@@ -453,6 +709,11 @@ static void __exit dummy_cleanup_module(void)
  		device_unregister(&dummy_parent);
  		bus_unregister(&dummy_bus);
  	}
@@ -386,7 +387,7 @@ index 58483af80..bea0f71d7 100644
  }
  
  module_init(dummy_init_module);
-@@ -460,3 +718,4 @@ module_exit(dummy_cleanup_module);
+@@ -460,3 +721,4 @@ module_exit(dummy_cleanup_module);
  MODULE_LICENSE("GPL");
  MODULE_ALIAS_RTNL_LINK(DRV_NAME);
  MODULE_VERSION(DRV_VERSION);
