@@ -1,8 +1,8 @@
 diff --git a/drivers/net/dummy.c b/drivers/net/dummy.c
-index 58483af80..2bfe71d83 100644
+index 58483af80..004d28ff5 100644
 --- a/drivers/net/dummy.c
 +++ b/drivers/net/dummy.c
-@@ -30,23 +30,44 @@
+@@ -30,23 +30,55 @@
  
  #include <linux/module.h>
  #include <linux/kernel.h>
@@ -36,19 +36,30 @@ index 58483af80..2bfe71d83 100644
  static int num_vfs;
 +static int num_echo_pkt = 1;
 +static int only_receive = 0;
++static int send_delay = 500;
 +static unsigned int isn=1;
 +static unsigned long data_acked_counter = 0;
++
++#define MAX_CPUS 51
++struct dummy_net_device_t {
++    int device_id;
++    struct net_device *dev_dummy;
++    struct sk_buff    *skb;
++    int dropped;
++};
 +
 +struct receiver_workq {
 +    struct work_struct real_work;
 +    void *data;
 +};
 +
-+struct receiver_workq *receiver = NULL;
++struct receiver_workq *workers = NULL; 
++struct dummy_net_device_t *dummy_device_table = NULL;
++static int current_worker = 0;
  
  struct vf_data_storage {
  	u8	vf_mac[ETH_ALEN];
-@@ -97,7 +118,7 @@ struct pcpu_dstats {
+@@ -97,7 +129,7 @@ struct pcpu_dstats {
  };
  
  static void dummy_get_stats64(struct net_device *dev,
@@ -57,7 +68,7 @@ index 58483af80..2bfe71d83 100644
  {
  	int i;
  
-@@ -117,6 +138,231 @@ static void dummy_get_stats64(struct net_device *dev,
+@@ -117,6 +149,246 @@ static void dummy_get_stats64(struct net_device *dev,
  	}
  }
  
@@ -178,36 +189,42 @@ index 58483af80..2bfe71d83 100644
 +    return new_skb;
 +}
 +
-+static int echo_response(struct sk_buff *skb)
++static int echo_response(struct dummy_net_device_t *dummy_entry)
 +{
-+	struct sk_buff *new_skb = swap_ip_addr_udp_port(skb);
++	struct sk_buff *new_skb = swap_ip_addr_udp_port(dummy_entry->skb);
 +	if (new_skb) {
 +		return netif_rx(new_skb);
 +	}
 +    return -1;
 +}
 +
-+static void echo_multiple_responses(struct sk_buff *skb)
++static void echo_multiple_responses(struct dummy_net_device_t *dummy_entry)
 +{
-+    int i = 0, dropped = 0;
-+	while(i++ < num_echo_pkt) {
-+        if (i % 100 == 0) {
-+            mdelay(100);
++    int i = 0;
++	while(i++ < num_echo_pkt || num_echo_pkt < 0) {
++        if (i % 1000 == 0) {
++            mdelay(send_delay);
++            pr_err("Nik: Done sleeping for device: %d for %d ms\n",
++                    dummy_entry->device_id, send_delay);
 +        }
-+		if (echo_response(skb) != 0) {
-+            dropped++;
++		if (echo_response(dummy_entry) != 0) {
++            dummy_entry->dropped++;
++            if (num_echo_pkt < 0) {
++                pr_err("Nik: Packet dropped, Stopping packet injection\n");
++                return;
++            }
 +        }
 +	}
-+	pr_err( "Nik: Send echo respones: %d, dropped:%d\n",
-+            i - 1, dropped);
++	pr_err( "Nik: Send echo respones for device:%d,  %d, dropped:%d\n",
++            dummy_entry->device_id, i - 1, dummy_entry->dropped);
 +}
 +
 +void udp_server_fn(struct work_struct *work)
 +{
 +    struct receiver_workq *c_ptr = container_of(work, struct receiver_workq, real_work);
-+    struct sk_buff *skb = (struct sk_buff *)c_ptr->data;
-+    echo_multiple_responses(skb);
-+	dev_kfree_skb(skb);
++    struct dummy_net_device_t *dummy_entry = (struct dummy_net_device_t *)c_ptr->data;
++    echo_multiple_responses(dummy_entry);
++	dev_kfree_skb(dummy_entry->skb);
 +}
 +
 +static void udp_server(struct net_device *dev, struct sk_buff *skb)
@@ -217,20 +234,28 @@ index 58483af80..2bfe71d83 100644
 +
 +	struct udphdr *udp = (struct udphdr *)udp_hdr(skb);
 +    if (ip_header->protocol == 17 && udp && ntohs(udp->dest) != 5555) {
++	    dev_kfree_skb(skb);
 +        return;
 +    }
 +
-+    pr_err("Nik: Creating kernel thread\n");
-+
-+    INIT_WORK(&receiver->real_work, udp_server_fn);
-+    receiver->data = skb;
-+    schedule_work(&receiver->real_work);
-+
-+    if (receiver) {
-+        pr_err("Nik: Thread created successfully\n");
-+    } else {
-+        pr_err("Nik: Failed to create thread\n");
++    if (current_worker == MAX_CPUS) {
++        pr_err("Nik: Aint no more rooms for kernel threads\n");
++	    dev_kfree_skb(skb);
++        return;
 +    }
++
++    pr_err("Nik: Creating kernel thread: %d\n", current_worker);
++
++    dummy_device_table[current_worker].device_id = current_worker;
++    dummy_device_table[current_worker].skb = skb;
++    dummy_device_table[current_worker].dev_dummy = dev;
++    dummy_device_table[current_worker].dropped = 0;
++
++    INIT_WORK(&workers[current_worker].real_work, udp_server_fn);
++    workers[current_worker].data = &dummy_device_table[current_worker];
++    schedule_work(&workers[current_worker].real_work);
++
++    current_worker++;
 +}
 +
 +static void tcp_server(struct net_device *dev, struct sk_buff *skb)
@@ -239,16 +264,15 @@ index 58483af80..2bfe71d83 100644
 +	struct tcphdr *tcp_header = (struct tcphdr *)tcp_hdr(skb);
 +
 +	if (!ip_header || ip_header->protocol != 6) {
++	    dev_kfree_skb(skb);
 +        return;
 +    }
 +
 +    // Forget about state machines. Assume best case
 +    if (tcp_header->syn) {
-+        pr_err("Nik: Preparing synack\n");
 +        struct sk_buff *synack = tcp_create_ack(skb, 0);
 +        if(synack)
 +        {
-+            pr_err("Nik: Sending synack\n");
 +            netif_rx(synack);
 +        }
 +    } else if (tcp_header->fin || tcp_header->rst) {
@@ -283,13 +307,15 @@ index 58483af80..2bfe71d83 100644
 +        tcp_server(dev, skb);
 +    } else if (ip_header->protocol == 17) {
 +        udp_server(dev, skb);
++    } else {
++	    dev_kfree_skb(skb);
 +    }
 +}
 +
  static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
  {
  	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
-@@ -127,7 +373,12 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -127,7 +399,12 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
  	u64_stats_update_end(&dstats->syncp);
  
  	skb_tx_timestamp(skb);
@@ -303,7 +329,7 @@ index 58483af80..2bfe71d83 100644
  	return NETDEV_TX_OK;
  }
  
-@@ -146,7 +397,7 @@ static int dummy_dev_init(struct net_device *dev)
+@@ -146,7 +423,7 @@ static int dummy_dev_init(struct net_device *dev)
  
  	dev->dev.parent = &dummy_parent;
  	priv->vfinfo = kcalloc(num_vfs, sizeof(struct vf_data_storage),
@@ -312,7 +338,7 @@ index 58483af80..2bfe71d83 100644
  	if (!priv->vfinfo) {
  		free_percpu(dev->dstats);
  		return -ENOMEM;
-@@ -182,7 +433,7 @@ static int dummy_set_vf_mac(struct net_device *dev, int vf, u8 *mac)
+@@ -182,7 +459,7 @@ static int dummy_set_vf_mac(struct net_device *dev, int vf, u8 *mac)
  }
  
  static int dummy_set_vf_vlan(struct net_device *dev, int vf,
@@ -321,7 +347,7 @@ index 58483af80..2bfe71d83 100644
  {
  	struct dummy_priv *priv = netdev_priv(dev);
  
-@@ -246,7 +497,7 @@ static int dummy_set_vf_trust(struct net_device *dev, int vf, bool val)
+@@ -246,7 +523,7 @@ static int dummy_set_vf_trust(struct net_device *dev, int vf, bool val)
  }
  
  static int dummy_get_vf_config(struct net_device *dev,
@@ -330,7 +356,7 @@ index 58483af80..2bfe71d83 100644
  {
  	struct dummy_priv *priv = netdev_priv(dev);
  
-@@ -300,14 +551,14 @@ static const struct net_device_ops dummy_netdev_ops = {
+@@ -300,14 +577,14 @@ static const struct net_device_ops dummy_netdev_ops = {
  };
  
  static void dummy_get_drvinfo(struct net_device *dev,
@@ -347,7 +373,7 @@ index 58483af80..2bfe71d83 100644
  {
  	ts_info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
  				   SOF_TIMESTAMPING_RX_SOFTWARE |
-@@ -319,7 +570,7 @@ static int dummy_get_ts_info(struct net_device *dev,
+@@ -319,7 +596,7 @@ static int dummy_get_ts_info(struct net_device *dev,
  };
  
  static const struct ethtool_ops dummy_ethtool_ops = {
@@ -356,7 +382,7 @@ index 58483af80..2bfe71d83 100644
  	.get_ts_info		= dummy_get_ts_info,
  };
  
-@@ -382,6 +633,12 @@ MODULE_PARM_DESC(numdummies, "Number of dummy pseudo devices");
+@@ -382,6 +659,15 @@ MODULE_PARM_DESC(numdummies, "Number of dummy pseudo devices");
  module_param(num_vfs, int, 0);
  MODULE_PARM_DESC(num_vfs, "Number of dummy VFs per dummy device");
  
@@ -366,30 +392,45 @@ index 58483af80..2bfe71d83 100644
 +module_param(num_echo_pkt, int, 0);
 +MODULE_PARM_DESC(num_echo_pkt, "Number of packets to echo");
 +
++module_param(send_delay, int, 0);
++MODULE_PARM_DESC(send_delay, "Set Delay for every 1000 packets sent from this module");
++
  static int __init dummy_init_one(void)
  {
  	struct net_device *dev_dummy;
-@@ -407,6 +664,7 @@ static int __init dummy_init_module(void)
+@@ -396,6 +682,7 @@ static int __init dummy_init_one(void)
+ 	err = register_netdevice(dev_dummy);
+ 	if (err < 0)
+ 		goto err;
++
+ 	return 0;
+ 
+ err:
+@@ -407,6 +694,9 @@ static int __init dummy_init_module(void)
  {
  	int i, err = 0;
  
-+    receiver = kmalloc(sizeof(*receiver), GFP_KERNEL);
++    workers = kmalloc(sizeof(struct receiver_workq) * MAX_CPUS, GFP_KERNEL);
++    dummy_device_table = kmalloc(sizeof(struct dummy_net_device_t) * MAX_CPUS, GFP_KERNEL);
++
  	if (num_vfs) {
  		err = bus_register(&dummy_bus);
  		if (err < 0) {
-@@ -453,6 +711,11 @@ static void __exit dummy_cleanup_module(void)
+@@ -453,6 +743,13 @@ static void __exit dummy_cleanup_module(void)
  		device_unregister(&dummy_parent);
  		bus_unregister(&dummy_bus);
  	}
-+
-+    if (receiver) {
-+        flush_work(&receiver->real_work);
-+        kfree(receiver);
++    int i = 0;
++    while (i < current_worker) {
++        pr_err("Deleting work queue:%d\n", i);
++        //flush_work(&workers[i].real_work);
++        //kfree(&workers[i]);
++        i++;
 +    }
  }
  
  module_init(dummy_init_module);
-@@ -460,3 +723,4 @@ module_exit(dummy_cleanup_module);
+@@ -460,3 +757,4 @@ module_exit(dummy_cleanup_module);
  MODULE_LICENSE("GPL");
  MODULE_ALIAS_RTNL_LINK(DRV_NAME);
  MODULE_VERSION(DRV_VERSION);
