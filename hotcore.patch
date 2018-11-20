@@ -1,0 +1,298 @@
+diff --git a/.scmversion b/.scmversion
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/include/linux/cpu.h b/include/linux/cpu.h
+index b216bd5bf..b122d0a34 100644
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -110,6 +110,7 @@ extern void cpu_hotplug_disable(void);
+ extern void cpu_hotplug_enable(void);
+ void clear_tasks_mm_cpumask(int cpu);
+ int cpu_down(unsigned int cpu);
++int cpu_is_isolated(int cpu);
+ 
+ #else /* CONFIG_HOTPLUG_CPU */
+ 
+diff --git a/include/linux/sched/isolation.h b/include/linux/sched/isolation.h
+index d849431c8..82d8a6749 100644
+--- a/include/linux/sched/isolation.h
++++ b/include/linux/sched/isolation.h
+@@ -47,5 +47,6 @@ static inline bool housekeeping_cpu(int cpu, enum hk_flags flags)
+ #endif
+ 	return true;
+ }
++bool housekeeping_set_cpu(int cpu, enum hk_flags flags);
+ 
+ #endif /* _LINUX_SCHED_ISOLATION_H */
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index f760063fb..537080067 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -10,6 +10,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sched/hotplug.h>
+ #include <linux/sched/task.h>
++#include <linux/sched/isolation.h>
+ #include <linux/unistd.h>
+ #include <linux/cpu.h>
+ #include <linux/oom.h>
+@@ -68,6 +69,8 @@ struct cpuhp_cpu_state {
+ 	struct completion	done_up;
+ 	struct completion	done_down;
+ #endif
++    /* Per cpu state info. */
++	bool			isolcpu;
+ };
+ 
+ static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {
+@@ -120,6 +123,7 @@ struct cpuhp_step {
+ 	} teardown;
+ 	struct hlist_head	list;
+ 	bool			skip_onerr;
++    bool            skip_setup_when_isol;
+ 	bool			cant_stop;
+ 	bool			multi_instance;
+ };
+@@ -179,6 +183,12 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 		cb = bringup ? step->startup.single : step->teardown.single;
+ 		if (!cb)
+ 			return 0;
++        if (step->skip_setup_when_isol && st->isolcpu && bringup) {
++	        pr_warn("Nik: %s: Skipping running startup routine"
++                    " because isolcpu is set for cpu: %d, state: %d\n",
++                    __FUNCTION__, cpu, st->state);
++            return 0;
++        }
+ 		trace_cpuhp_enter(cpu, st->target, state, cb);
+ 		ret = cb(cpu);
+ 		trace_cpuhp_exit(cpu, st->state, state, ret);
+@@ -190,6 +200,12 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 
+ 	/* Single invocation for instance add/remove */
+ 	if (node) {
++        if (step->skip_setup_when_isol && st->isolcpu && bringup) {
++	        pr_warn("Nik: %s: Skipping running startup routine for multi"
++                    " because isolcpu is set for cpu: %d, state: %d\n",
++                    __FUNCTION__, cpu, st->state);
++            return 0;
++        }
+ 		WARN_ON_ONCE(lastp && *lastp);
+ 		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, node);
+ 		ret = cbm(cpu, node);
+@@ -197,6 +213,14 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
+ 		return ret;
+ 	}
+ 
++    /* This doesn't seem right. Come back again */
++    if (step->skip_setup_when_isol && st->isolcpu && bringup) {
++        pr_warn("Nik: %s: Skipping running startup routine for multi1"
++                " because isolcpu is set for cpu: %d, state: %d\n",
++                __FUNCTION__, cpu, st->state);
++        return 0;
++    }
++
+ 	/* State transition. Invoke on all instances */
+ 	cnt = 0;
+ 	hlist_for_each(node, &step->list) {
+@@ -340,6 +364,7 @@ static void __cpu_hotplug_enable(void)
+ 
+ void cpu_hotplug_enable(void)
+ {
++	pr_warn("Nik: %s\n", __FUNCTION__);
+ 	cpu_maps_update_begin();
+ 	__cpu_hotplug_enable();
+ 	cpu_maps_update_done();
+@@ -429,6 +454,7 @@ static inline bool cpu_smt_allowed(unsigned int cpu) { return true; }
+ static inline enum cpuhp_state
+ cpuhp_set_state(struct cpuhp_cpu_state *st, enum cpuhp_state target)
+ {
++	pr_warn("Nik: %s, set state to: %d\n", __FUNCTION__, target);
+ 	enum cpuhp_state prev_state = st->state;
+ 
+ 	st->rollback = false;
+@@ -579,6 +605,7 @@ static int cpuhp_up_callbacks(unsigned int cpu, struct cpuhp_cpu_state *st,
+  */
+ static void cpuhp_create(unsigned int cpu)
+ {
++	pr_warn("Nik: %s\n", __FUNCTION__);
+ 	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+ 
+ 	init_completion(&st->done_up);
+@@ -1023,6 +1050,17 @@ int cpu_down(unsigned int cpu)
+ }
+ EXPORT_SYMBOL(cpu_down);
+ 
++
++int cpu_is_isolated(int cpu)
++{
++	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
++    if (st) {
++        return st->isolcpu;
++    }
++    return 0;
++}
++EXPORT_SYMBOL(cpu_is_isolated);
++
+ #else
+ #define takedown_cpu		NULL
+ #endif /*CONFIG_HOTPLUG_CPU*/
+@@ -1443,6 +1481,7 @@ static struct cpuhp_step cpuhp_ap_states[] = {
+ 		.name			= "irq/affinity:online",
+ 		.startup.single		= irq_affinity_online_cpu,
+ 		.teardown.single	= NULL,
++        .skip_setup_when_isol = true,
+ 	},
+ 	[CPUHP_AP_PERF_ONLINE] = {
+ 		.name			= "perf:online",
+@@ -1453,6 +1492,7 @@ static struct cpuhp_step cpuhp_ap_states[] = {
+ 		.name			= "workqueue:online",
+ 		.startup.single		= workqueue_online_cpu,
+ 		.teardown.single	= workqueue_offline_cpu,
++        .skip_setup_when_isol = true,
+ 	},
+ 	[CPUHP_AP_RCUTREE_ONLINE] = {
+ 		.name			= "RCU/tree:online",
+@@ -1470,6 +1510,7 @@ static struct cpuhp_step cpuhp_ap_states[] = {
+ 		.name			= "sched:active",
+ 		.startup.single		= sched_cpu_activate,
+ 		.teardown.single	= sched_cpu_deactivate,
++        //.skip_setup_when_isol = true,
+ 	},
+ #endif
+ 
+@@ -1903,10 +1944,12 @@ static ssize_t write_cpuhp_target(struct device *dev,
+ 	if (ret)
+ 		goto out;
+ 
+-	if (st->state < target)
++	if (st->state < target) {
+ 		ret = do_cpu_up(dev->id, target);
+-	else
++    } else {
++        st->isolcpu = 0;
+ 		ret = do_cpu_down(dev->id, target);
++    }
+ out:
+ 	unlock_device_hotplug();
+ 	return ret ? ret : count;
+@@ -1921,6 +1964,66 @@ static ssize_t show_cpuhp_target(struct device *dev,
+ }
+ static DEVICE_ATTR(target, 0644, show_cpuhp_target, write_cpuhp_target);
+ 
++static ssize_t write_cpuhp_isolcpu(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++    // TODO: Don't do anything if isolcpu is set
++	pr_warn("Nik: %s\n", __FUNCTION__);
++	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, dev->id);
++	struct cpuhp_step *sp;
++	int isolcpu, ret;
++
++	ret = kstrtoint(buf, 10, &isolcpu);
++	if (ret)
++		return ret;
++
++
++	ret = lock_device_hotplug_sysfs();
++	if (ret)
++		return ret;
++
++	if (isolcpu && st->state == CPUHP_ONLINE) {
++        st->isolcpu = true;
++		ret = do_cpu_down(dev->id, CPUHP_OFFLINE);
++        if (ret) {
++	        pr_warn("Nik: Failed to bring down the cpu: %s\n", __FUNCTION__);
++            goto out;
++        }
++
++        /* Add this cpu to HF_DOMAIN so its treated as though isolcpu 
++         * command line parameter is set for this cpu */
++        pr_warn("Nik: %s: Setting isolated param to cpu: %d\n", __FUNCTION__, dev->id);
++        if (housekeeping_set_cpu(dev->id, HK_FLAG_DOMAIN) == false) {
++	        pr_warn("Nik: Failed to isolate cpu on the sched: %s\n", __FUNCTION__);
++            goto out;
++        }
++
++		ret = do_cpu_up(dev->id, CPUHP_ONLINE);
++    } else if (!isolcpu && st->isolcpu && st->state == CPUHP_ONLINE) {
++	    pr_warn("Nik: Disabling isolcpu: %s\n", __FUNCTION__);
++        st->isolcpu = false;
++		ret = do_cpu_down(dev->id, CPUHP_OFFLINE);
++        if (ret) {
++	        pr_warn("Nik: Failed to bring down the cpu: %s\n", __FUNCTION__);
++            goto out;
++        }
++        /* TODO: Clear HK_FLAG_DOMAIN only if it was set by us. Else, don't touch it! */
++		ret = do_cpu_up(dev->id, CPUHP_ONLINE);
++    }
++out:
++	unlock_device_hotplug();
++	return ret ? ret : count;
++}
++static ssize_t show_cpuhp_isolcpu(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	pr_warn("Nik: %s\n", __FUNCTION__);
++	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, dev->id);
++
++	return sprintf(buf, "%d\n", st->isolcpu);
++}
++static DEVICE_ATTR(isolcpu, 0644, show_cpuhp_isolcpu, write_cpuhp_isolcpu);
+ 
+ static ssize_t write_cpuhp_fail(struct device *dev,
+ 				struct device_attribute *attr,
+@@ -1970,6 +2073,7 @@ static struct attribute *cpuhp_cpu_attrs[] = {
+ 	&dev_attr_state.attr,
+ 	&dev_attr_target.attr,
+ 	&dev_attr_fail.attr,
++	&dev_attr_isolcpu.attr,
+ 	NULL
+ };
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 9aea91931..59da56e46 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1072,6 +1072,8 @@ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+  * task must not exit() & deallocate itself prematurely. The
+  * call is not atomic; no spinlocks may be held.
+  */
++
++/* TODO: Read this code properly */
+ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 				  const struct cpumask *new_mask, bool check)
+ {
+@@ -1086,7 +1088,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
+ 
+ 	if (p->flags & PF_KTHREAD) {
+ 		/*
+-		 * Kernel threads are allowed on online && !active CPUs
++		 * Kernel threads are allowed on online && !active CPU && !isolcpu
+ 		 */
+ 		cpu_valid_mask = cpu_online_mask;
+ 	}
+diff --git a/kernel/sched/isolation.c b/kernel/sched/isolation.c
+index b71b436f5..ad2c3a938 100644
+--- a/kernel/sched/isolation.c
++++ b/kernel/sched/isolation.c
+@@ -115,6 +115,19 @@ static int __init housekeeping_setup(char *str, enum hk_flags flags)
+ 	return 1;
+ }
+ 
++bool housekeeping_set_cpu(int cpu, enum hk_flags flags)
++{
++    char buf[10];
++
++    if (housekeeping_test_cpu(cpu, flags) == true) {
++        return true;
++    }
++    housekeeping_flags |= flags;
++    sprintf(buf, "%d\n", cpu); 
++    return housekeeping_setup(buf, housekeeping_flags);
++}
++EXPORT_SYMBOL_GPL(housekeeping_set_cpu);
++
+ static int __init housekeeping_nohz_full_setup(char *str)
+ {
+ 	unsigned int flags;
